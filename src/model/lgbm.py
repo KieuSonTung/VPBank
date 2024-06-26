@@ -14,14 +14,16 @@ from src.evaluate.evaluate import plot_confusion_matrix, plot_roc
 
 
 class LGBM():
-    def __init__(self, train_df, test_df) -> None:
+    def __init__(self, train_df) -> None:
         self.train_df = train_df
-        self.test_df = test_df
     
     def _process_X_y(self):
+        income_mapping = {'no': 0, 'yes': 1}
+        self.train_df['high_income'] = self.train_df['high_income'].map(income_mapping)
+
+        self.train_df = label_encode_datasets(self.train_df)
+
         self.X = self.train_df.drop('high_income', axis=1)
-        self.X, self.test_df = label_encode_datasets(self.X, self.test_df)
-        
         self.y = self.train_df['high_income']
 
     def _find_best_params(self, n_splits, n_trials):
@@ -195,16 +197,3 @@ class LGBM():
 
         # Save best model as pickle file
         self.save_best_model()
-    
-    def infer(self, model_path):
-        model = joblib.load(model_path)
-
-        ids = self.test_df['id']
-
-        probs = model.predict(self.test_df)
-        result_df = pd.DataFrame({
-            'id': ids,
-            'probability': probs
-        })
-
-        return result_df
