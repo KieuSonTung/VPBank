@@ -1,7 +1,7 @@
 from sklearn.model_selection import StratifiedKFold
 import pandas as pd
 import numpy as np
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score, classification_report
 from sklearn.model_selection import train_test_split
 import optuna
 import lightgbm as lgb
@@ -14,17 +14,30 @@ from src.evaluate.evaluate import plot_confusion_matrix, plot_roc
 
 
 class LGBM():
-    def __init__(self, train_df) -> None:
+    def __init__(self, train_df: pd.DataFrame) -> None:
+        '''
+        Params:
+            train_df: train set
+        Args:
+            cls_report: metrics
+            best_model: model with highest F1 Score
+            best_params: hyperparameters with highest F1 Score
+        '''
         self.train_df = train_df
+        self.cls_report = None
+        self.best_model = None
+        self.best_params = None
     
     def _process_X_y(self):
         income_mapping = {'no': 0, 'yes': 1}
         self.train_df['high_income'] = self.train_df['high_income'].map(income_mapping)
 
-        self.train_df = label_encode_datasets(self.train_df)
+        # self.train_df = label_encode_datasets(self.train_df)
 
-        self.X = self.train_df.drop('high_income', axis=1)
-        self.y = self.train_df['high_income']
+        X = self.train_df.drop('high_income', axis=1)
+        y = self.train_df['high_income']
+
+        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
     def _find_best_params(self, n_splits, n_trials):
         def objective(trial):
@@ -67,9 +80,12 @@ class LGBM():
             aucs = []
             
             # Perform Stratified K-Fold cross-validation
-            for train_index, valid_index in skf.split(self.X, self.y):
-                train_x, valid_x = self.X.iloc[train_index], self.X.iloc[valid_index]
-                train_y, valid_y = self.y.iloc[train_index], self.y.iloc[valid_index]
+            for train_index, valid_index in skf.split(self.X_train, self.y_train):
+                train_x, valid_x = self.X_train.iloc[train_index], self.X_train.iloc[valid_index]
+                train_y, valid_y = self.y_train.iloc[train_index], self.y_train.iloc[valid_index]
+
+                train_x = label_encode_datasets(df=train_x, train=True)
+                valid_x = label_encode_datasets(df=valid_x, train=False)
                 
                 # Train the model
                 dtrain = lgb.Dataset(train_x, label=train_y)
@@ -115,29 +131,36 @@ class LGBM():
             # Print mean metrics for this trial
             print(f"VALID: Trial {trial.number} - Accuracy: {mean_accuracy}, F1: {mean_f1}, Precision: {mean_precision}, Recall: {mean_recall}, AUC: {mean_auc}")
             
+            trial.set_user_attr(key="best_booster", value=gbm)
             # Return a single metric (mean accuracy in this case) for optimization
             return mean_f1
+        
+        def callback(study, trial):
+            if study.best_trial.number == trial.number:
+                study.set_user_attr(key="best_booster", value=trial.user_attrs["best_booster"])
 
         # Create the study and optimize the objective function
         study = optuna.create_study(direction='maximize')
-        study.optimize(objective, n_trials=n_trials)
+        study.optimize(
+            objective,
+            n_trials=n_trials,
+            callbacks=[callback]
+        )
 
         print('Number of finished trials:', len(study.trials))
         print('Best trial:')
         self.best_trial = study.best_trial
 
-        print('  Value: {}'.format(self.best_trial.value))
-        print('  Params: ')
+        self.best_model = study.user_attrs["best_booster"]
 
-        for key, value in self.best_trial.params.items():
-            print('    {}: {}'.format(key, value))
+        print('  Value: {}'.format(self.best_trial.value))
 
     def plot_feat_imp(self, model, n_features=5):
         importance = model.feature_importance()
 
         # Create a DataFrame with feature names and their importance
         feature_importance_df = pd.DataFrame({
-            'feature': self.X.columns,
+            'feature': self.X_train.columns,
             'importance': importance
         })
         
@@ -153,42 +176,40 @@ class LGBM():
         plt.show()
     
     def save_best_params(self):
-        best_params = self.best_trial.params
-        best_params['objective'] = 'binary'
-        best_params['metric'] = 'binary_logloss'
-        best_params['boosting_type'] = 'gbdt'
-        best_params['verbose'] = -1
-        best_params['feature_pre_filter'] = False
-        best_params['n_jobs'] = -1
+        self.best_params = self.best_trial.params
+        self.best_params['objective'] = 'binary'
+        self.best_params['metric'] = 'binary_logloss'
+        self.best_params['boosting_type'] = 'gbdt'
+        self.best_params['verbose'] = -1
+        self.best_params['feature_pre_filter'] = False
+        self.best_params['n_jobs'] = -1
 
-        return best_params
+    def evaluate(self):
+        self.save_best_params()
 
-    def save_best_model(self):
-        best_params = self.save_best_params()
-        train_x, val_x, train_y, val_y = train_test_split(self.X, self.y)
-
-        dtrain = lgb.Dataset(train_x, label=train_y)
-        dval = lgb.Dataset(val_x, label=val_y)
-
-        best_gbm = lgb.train(best_params, dtrain, num_boost_round=100)
+        # Preprocess test set
+        self.X_test = label_encode_datasets(self.X_test, train=False)
 
         # Plot feature importance
-        self.plot_feat_imp(best_gbm)
+        self.plot_feat_imp(self.best_model)
 
         # Infer
-        y_prob = best_gbm.predict(val_x)
+        y_prob = self.best_model.predict(self.X_test)
         y_pred = (y_prob > 0.5).astype(int)
 
+        # Classification report
+        self.cls_report = classification_report(y_pred=y_pred, y_true=self.y_test, output_dict=True)
+
         # Plot confusion matrix
-        plot_confusion_matrix(val_y, y_pred)
+        plot_confusion_matrix(self.y_test, y_pred)
 
         # Plot ROC
-        plot_roc(val_y, y_prob)
+        plot_roc(self.y_test, y_prob)
 
         # Save the best model
-        joblib.dump(best_gbm, generate_new_file_path('../weights/best_lgbm.pkl'))
+        joblib.dump(self.best_model, generate_new_file_path('../weights/best_lgbm.pkl'))
     
-    def finetune(self, n_splits=5, n_trials=10):
+    def run(self, n_splits=2, n_trials=2):
         # Process data
         self._process_X_y()
 
@@ -196,4 +217,4 @@ class LGBM():
         self._find_best_params(n_splits=n_splits, n_trials=n_trials)
 
         # Save best model as pickle file
-        self.save_best_model()
+        self.evaluate()
